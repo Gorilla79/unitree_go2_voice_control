@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os, sys, time, json, subprocess, signal, threading
+
+# ===== 환경 =====
+VOSK_MODEL_DIR = os.environ.get("VOSK_MODEL_DIR", "/models/vosk-ko")
+MIC_DEVICE     = os.environ.get("MIC_DEVICE", "plughw:0,0")  # arecord 장치
+GO2_IFACE      = os.environ.get("GO2_IFACE", "eth0")
+RUN_BIN        = os.environ.get("GO2_BIN", "/home/unitree/unitree_sdk2-main/build/bin/go2_motion2")
+
+# sudo 실행이 필요하면 1로. (또는 파이썬 자체를 sudo로 실행해도 OK)
+RUN_WITH_SUDO  = os.environ.get("RUN_WITH_SUDO", "1") in ("1","true","TRUE")
+
+HOME   = os.path.expanduser("~")
+LIB1   = f"{HOME}/unitree_sdk2-main/lib/aarch64"
+LIB2   = f"{HOME}/unitree_sdk2-main/thirdparty/lib/aarch64"
+LDVAL  = f"{LIB1}:{LIB2}:{os.environ.get('LD_LIBRARY_PATH','')}"
+ENV    = os.environ.copy()
+ENV["LD_LIBRARY_PATH"] = LDVAL
+
+# ===== go2_motion 프로세스 관리 =====
+class Go2Motion:
+    def __init__(self, bin_path: str, iface: str, sudo: bool = True):
+        self.bin = bin_path
+        self.iface = iface
+        self.sudo = sudo
+        self.p = None
+
+    def start(self):
+        if not os.path.isfile(self.bin):
+            print(f"[ERR] go2_motion not found: {self.bin}", file=sys.stderr)
+            sys.exit(2)
+        base_cmd = [self.bin, self.iface]
+        if self.sudo:
+            # sudo 비번 프롬프트 없이 실행하려면 sudoers에 NOPASSWD 설정 추천
+            cmd = ["sudo","-n","-E"] + base_cmd
+        else:
+            cmd = base_cmd
+        print(f"[INFO] launch: {' '.join(cmd)}")
+        # stdin 파이프로 연결하여 번호와 /go를 흘려보냄
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, env=ENV, text=True, bufsize=1)
+        # 로그를 콘솔에 그대로 보여주기
+        threading.Thread(target=self._pump_stdout, daemon=True).start()
+
+    def _pump_stdout(self):
+        if not self.p or not self.p.stdout: return
+        for line in self.p.stdout:
+            print(f"[GO2] {line.rstrip()}")
+
+    def alive(self):
+        return self.p and (self.p.poll() is None)
+
+    def send(self, s: str):
+        """번호('8' 등)나 '/go' 같은 특수 신호를 보냅니다."""
+        if not self.alive():
+            print("[ERR] go2_motion not running", file=sys.stderr); return
+        try:
+            self.p.stdin.write(s.strip()+"\n")
+            self.p.stdin.flush()
+            print(f"[TX] {s}")
+        except Exception as e:
+            print(f"[ERR] write failed: {e}", file=sys.stderr)
+
+    def stop(self):
+        try:
+            if self.alive():
+                self.p.terminate()
+                time.sleep(0.3)
+                if self.alive():
+                    self.p.kill()
+        except: pass
+
+# ===== 명령어 매핑 =====
+def map_text_to_command(text: str):
+    """
+    반환: ('num', '8')  -> 번호 보내기
+          ('go',  None) -> '/go' 보내기(특수 트리거)
+          (None, None)  -> 매칭 없음
+    """
+    t = text.replace(" ", "")
+
+    # 인사
+    if any(k in t for k in ["안녕","인사"]):
+        return ("num", "8")          # Hello
+
+    # 앉아 → 3
+    if any(k in t for k in ["앉자","앉아","앉아줘","앉혀","앉기"]):
+        return ("num", "3")          # Sit (규칙상 이후 '일어서' 때 '/go'로 RiseSit)
+
+    # 엎드려 → 2
+    if any(k in t for k in ["엎드려","엎드려라","바닥","웅크려"]):
+        return ("num", "2")          # StandDown (규칙상 이후 '일어서' 때 '/go'로 StandUp)
+
+    # 일어서 → 규칙상 '/go' (pending 된 동작 실행)
+    if any(k in t for k in ["일어서","일어나","서라","서줘"]):
+        return ("go", None)          # /go = 특수 트리거
+
+    # 스트레칭
+    if "스트레칭" in t:
+        return ("num", "9")          # Stretch
+
+    # 응원
+    if "응원" in t:
+        return ("num", "10")         # Content
+
+    # 사랑해
+    if any(k in t for k in ["사랑해","하트"]):
+        return ("num", "11")         # Heart
+
+    # 용서
+    if any(k in t for k in ["용서","사과","미안"]):
+        return ("num", "12")         # Scrape
+
+    # 점프
+    if "점프" in t:
+        return ("num", "13")         # FrontJump (우리 C++ 메뉴에서 13번)
+
+    return (None, None)
+
+# ===== ASR: arecord → Vosk (오프라인) =====
+def asr_loop(on_final_text):
+    try:
+        import vosk
+    except ImportError:
+        print("[ERR] pip install vosk", file=sys.stderr); sys.exit(2)
+    if not os.path.isdir(VOSK_MODEL_DIR):
+        print(f"[ERR] VOSK 모델 폴더가 없습니다: {VOSK_MODEL_DIR}", file=sys.stderr)
+        sys.exit(2)
+
+    print(f"[INFO] load vosk model: {VOSK_MODEL_DIR}")
+    model = vosk.Model(VOSK_MODEL_DIR)
+    rec   = vosk.KaldiRecognizer(model, 16000)
+    cmd = ["arecord","-D",MIC_DEVICE,"-f","S16_LE","-r","16000","-c","1","-t","raw"]
+    print(f"[INFO] mic: {MIC_DEVICE}, sr=16000, ch=1")
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    try:
+        partial_last = ""
+        while True:
+            data = p.stdout.read(3200)  # ~100ms
+            if not data:
+                time.sleep(0.01); continue
+            if rec.AcceptWaveform(data):
+                res = json.loads(rec.Result())
+                txt = (res.get("text") or "").strip()
+                if txt:
+                    on_final_text(txt)
+                partial_last = ""
+            else:
+                pres = json.loads(rec.PartialResult())
+                ptxt = (pres.get("partial") or "").strip()
+                if ptxt:
+                    print(f"[~] {ptxt}") 
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try: p.terminate()
+        except: pass
+
+def main():
+    # 1) go2_motion 실행
+    go2 = Go2Motion(RUN_BIN, GO2_IFACE, sudo=RUN_WITH_SUDO)
+    go2.start()
+    if not go2.alive():
+        print("[ERR] go2_motion launch failed", file=sys.stderr)
+        sys.exit(2)
+
+    print("[READY] 한국어로 명령하세요. (Ctrl+C 종료)")
+    # 2) 음성 루프
+    def on_text(txt: str):
+        print(f"\n[ASR] {txt}")
+        kind, payload = map_text_to_command(txt)
+        if kind == "num":
+            # C++ 실행 파일 직접 호출
+            subprocess.run(["sudo", RUN_BIN, payload],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=ENV)
+            print(f"[ACTION] 실행: {payload}")
+        elif kind == "go":
+            subprocess.run(["sudo", RUN_BIN, "/go"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=ENV)
+            print("[ACTION] 실행: /go")
+        else:
+            print("[NLP] 매칭 없음")
+
+    try:
+        asr_loop(on_text)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        go2.stop()
+        print("\n[EXIT] bye")
+
+if __name__ == "__main__":
+    main()
